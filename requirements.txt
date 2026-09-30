@@ -1,3 +1,7 @@
 openai>=1.66.0,<3.0.0
 python-dotenv>=1.0.0,<2.0.0
 pytest>=8.0.0,<10.0.0
+# Required by domain_assistant.GeminiGenerator (LLM_PROVIDER=gemini).
+# Imported lazily inside __init__, so OpenAI-only runs still work without it.
+google-genai>=1.0.0
+

@@ -266,6 +266,126 @@ class OpenAIGenerator:
         return answer
 
 
+class GeminiGenerator:
+    """Google AI Studio (Gemini) backend.
+
+    Drop-in replacement for OpenAIGenerator: it implements the same
+    TextGenerator protocol, so retrieval, chunking, the prompt, top_k and the
+    generated artifact format are all unchanged. Only the LLM provider differs,
+    which keeps the benchmark comparison honest.
+
+    Reads GEMINI_API_KEY and GEMINI_MODEL from .env.
+    """
+
+    def __init__(
+        self,
+        max_output_tokens: int = 800,
+        max_retries: int = 6,
+        base_delay: float = 8.0,
+        min_interval: float = 4.0,
+    ) -> None:
+        try:
+            from google import genai
+        except ImportError as exc:  # pragma: no cover - dependency guard
+            raise RuntimeError(
+                "google-genai is not installed; run "
+                "`python -m pip install -r requirements.txt`"
+            ) from exc
+
+        api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        self.model = os.getenv("GEMINI_MODEL", "").strip()
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY is missing from .env")
+        if not self.model:
+            raise RuntimeError("GEMINI_MODEL is missing from .env")
+
+        self._genai = genai
+        self.client = genai.Client(api_key=api_key)
+        # 800, not 300: Gemini counts reasoning tokens against the same budget,
+        # and at 300 the model returned finish_reason=MAX_TOKENS with a
+        # truncated answer. Verified with gemini-3.5-flash-lite.
+        self.max_output_tokens = max_output_tokens
+        self.max_retries = max_retries
+        self.base_delay = base_delay
+        self.min_interval = min_interval
+        self._last_call = 0.0
+
+    def _request_with_retry(self, prompt: str, config: Any) -> Any:
+        """Retry transient Gemini API failures with exponential backoff.
+
+        Kept because Gemini free-tier quota is not stable across the day: the
+        same model that runs cleanly now can return 503 UNAVAILABLE or 429
+        RESOURCE_EXHAUSTED later, which would abort a 20-question benchmark
+        part-way through. 4xx errors other than 429 (bad key, unavailable
+        model) raise immediately because retrying cannot fix them.
+        """
+        last_error: Exception | None = None
+        for attempt in range(1, self.max_retries + 1):
+            # Small politeness gap between calls to stay under the quota.
+            elapsed = time.monotonic() - self._last_call
+            if elapsed < self.min_interval:
+                time.sleep(self.min_interval - elapsed)
+            try:
+                self._last_call = time.monotonic()
+                return self.client.models.generate_content(
+                    model=self.model,
+                    contents=prompt,
+                    config=config,
+                )
+            except Exception as exc:  # noqa: BLE001 - re-raised below
+                last_error = exc
+                status = getattr(exc, "code", None)
+                if status is None:
+                    status = getattr(
+                        getattr(exc, "response", None), "status_code", None
+                    )
+                if status not in (429, 500, 502, 503, 504):
+                    raise
+                if attempt == self.max_retries:
+                    raise
+                delay = min(self.base_delay * (2 ** (attempt - 1)), 90.0)
+                print(
+                    f"  transient Gemini error ({status}) on attempt "
+                    f"{attempt}/{self.max_retries}; retrying in {delay:.0f}s",
+                    flush=True,
+                )
+                time.sleep(delay)
+        raise RuntimeError(f"Gemini request failed: {last_error}")
+
+    def generate(self, prompt: str) -> str:
+        config = self._genai.types.GenerateContentConfig(
+            temperature=0,
+            max_output_tokens=self.max_output_tokens,
+        )
+        response = self._request_with_retry(prompt, config)
+
+        # Blocked responses (e.g. a safety filter on an adversarial prompt)
+        # expose no .text, so read parts defensively.
+        answer = ""
+        candidates = getattr(response, "candidates", None) or []
+        for candidate in candidates:
+            content = getattr(candidate, "content", None)
+            for part in getattr(content, "parts", None) or []:
+                answer += getattr(part, "text", "") or ""
+
+        answer = answer.strip()
+        if not answer:
+            raise RuntimeError("Gemini returned an empty answer")
+        return answer
+
+
+def build_generator() -> TextGenerator:
+    """Select the LLM backend from LLM_PROVIDER in .env."""
+    provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
+    if provider == "gemini":
+        return GeminiGenerator()
+    if provider == "openai":
+        return OpenAIGenerator()
+    raise RuntimeError(
+        f"Unknown LLM_PROVIDER {provider!r}; expected 'gemini' or 'openai'"
+    )
+
+
 @dataclass(frozen=True)
 class DomainResponse:
     question: str
@@ -299,7 +419,7 @@ class DomainAssistant:
         return cls(
             corpus_id,
             BM25Retriever(chunks),
-            generator if generator is not None else OpenAIGenerator(),
+            generator if generator is not None else build_generator(),
             top_k,
         )
 
@@ -508,7 +628,13 @@ def main() -> int:
             json.dumps(artifact, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-    except (OSError, OpenAIError, TypeError, ValueError, RuntimeError) as exc:
+    except (
+        OSError,
+        OpenAIError,
+        TypeError,
+        ValueError,
+        RuntimeError,
+    ) as exc:
         print(f"ERROR: {exc}")
         return 2
     print(f"Generated {len(artifact['answers'])} actual answers: {output}")
